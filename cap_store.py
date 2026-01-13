@@ -1418,6 +1418,48 @@ def push_forecast_to_planning(
     if not vol_kind:
         return False, f"Unsupported channel '{channel}' for planning push.", None
 
+    def _related_plan_ids_for_scope(sk_full: str, ch_name: str) -> list[int]:
+        parts = (sk_full or "").split("|")
+        ba = (parts[0] if len(parts) > 0 else "").strip()
+        sba = (parts[1] if len(parts) > 1 else "").strip()
+        site = (parts[3] if len(parts) > 3 else "").strip()
+        ch_norm = (ch_name or "").strip().lower()
+        if not ba or not sba or not ch_norm:
+            return []
+
+        with _conn() as cx:
+            cols = {r["name"] for r in cx.execute("PRAGMA table_info(capacity_plans)")}
+            sql = "SELECT id, channel, site, location, is_current, status FROM capacity_plans WHERE 1=1"
+            params: list[Any] = []
+            if "is_deleted" in cols:
+                sql += " AND COALESCE(is_deleted,0)=0"
+            elif "deleted_at" in cols:
+                sql += " AND deleted_at IS NULL"
+            sql += " AND LOWER(vertical)=LOWER(?) AND LOWER(COALESCE(sub_ba,''))=LOWER(COALESCE(?,''))"
+            params.extend([ba, sba])
+            if site:
+                sql += " AND (LOWER(COALESCE(site,''))=LOWER(?) OR LOWER(COALESCE(location,''))=LOWER(?))"
+                params.extend([site, site])
+
+            rows = cx.execute(sql, params).fetchall()
+
+        def _plan_has_channel(row_channel: Any) -> bool:
+            txt = "" if row_channel is None else str(row_channel)
+            parts = [p.strip().lower() for p in txt.split(",") if p.strip()]
+            return ch_norm in parts
+
+        out: list[int] = []
+        for r in rows or []:
+            try:
+                pid = int(r["id"] if isinstance(r, dict) else r[0])
+            except Exception:
+                continue
+            row_channel = (r["channel"] if isinstance(r, dict) else r[1]) if r else ""
+            if not _plan_has_channel(row_channel):
+                continue
+            out.append(pid)
+        return out
+
     try:
         extra_cols = []
         for cand in ("interval", "interval_start"):
@@ -1449,6 +1491,16 @@ def push_forecast_to_planning(
             metadata=metadata,
             pushed_to_planning=True,
         )
+        try:
+            from plan_detail.calc_engine import mark_plan_dirty
+        except Exception:
+            mark_plan_dirty = None
+        if mark_plan_dirty is not None:
+            for pid in _related_plan_ids_for_scope(sk, channel):
+                try:
+                    mark_plan_dirty(pid)
+                except Exception:
+                    pass
         return True, "Forecast saved and pushed to planning.", run_id
     except Exception as exc:
         return False, f"Failed to push forecast: {exc}", None
